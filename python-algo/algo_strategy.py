@@ -43,6 +43,10 @@ class AlgoStrategy(gamelib.AlgoCore):
         CORES = 0
         # This is a good place to do initial setup
         self.scored_on_locations = []
+        self.firewall_loc = {"FF": [], "DF": [], "EF": []}
+        self.repair_queue = []
+        self.num_bits = 0
+        self.num_cores = 0
 
     
         
@@ -76,33 +80,63 @@ class AlgoStrategy(gamelib.AlgoCore):
         For offense we will use long range EMPs if they place stationary units near the enemy's front.
         If there are no stationary units to attack in the front, we will send Pings to try and score quickly.
         """
+        self.num_cores = game_state.get_resource(0)
+        self.num_bits = game_state.get_resource(1)
+        self.find_self_units(game_state)
+        # for key, val in self.firewall_loc.items():
+        #     gamelib.debug_write("{} loc: ".format(key) + "{}".format(val))
+
         # First, place basic defenses
         self.build_defences(game_state)
         # Now build reactive defenses based on where the enemy scored
         self.build_reactive_defense(game_state)
+        self.repair_defences(game_state)
+        self.upgrade(game_state)
 
         # If the turn is less than 5, stall with Scramblers and wait to see enemy's base
         if game_state.turn_number < 5:
             self.stall_with_scramblers(game_state)
         else:
+            self.build_def2(game_state)
+
             # Now let's analyze the enemy base to see where their defenses are concentrated.
             # If they have many units in the front we can build a line for our EMPs to attack them at long range.
-            if self.detect_enemy_unit(game_state, unit_type=None, valid_x=None, valid_y=[14, 15]) > 10:
+            if (self.detect_enemy_unit(game_state, unit_type=None, valid_x=None, valid_y=[14, 15]) > 10 
+                and self.num_bits > min(11 + game_state.turn_number / 5, 18)):
                 self.emp_line_strategy(game_state)
             else:
                 # They don't have many units in the front so lets figure out their least defended area and send Pings there.
 
                 # Only spawn Ping's every other turn
                 # Sending more at once is better since attacks can only hit a single ping at a time
-                if game_state.turn_number % 2 == 1:
+                ping_spawn_location_options = [[13, 0], [14, 0]]
+                best_location, dmg = self.least_damage_spawn_location(game_state, ping_spawn_location_options)
+                # gamelib.debug_write("best: {}".format(best_location))
+                
+                gamelib.debug_write(dmg)
+                if ((game_state.turn_number % 5 == 0 or dmg * 3 / 2 > self.num_bits * gamelib.GameUnit(FILTER, game_state.config).max_health) 
+                    and self.num_bits > min(14 + game_state.turn_number / 5, 20)):
+                    game_state.attempt_spawn(EMP, best_location, self.num_bits / 3 - 1)
+                    game_state.attempt_spawn(SCRAMBLER, best_location, 1000)
+                elif game_state.turn_number % 2 == 1 and game_state.get_resource(1) > 5 + game_state.turn_number / 5:
                     # To simplify we will just check sending them from back left and right
-                    ping_spawn_location_options = [[13, 0], [14, 0]]
-                    best_location = self.least_damage_spawn_location(game_state, ping_spawn_location_options)
                     game_state.attempt_spawn(PING, best_location, 1000)
-
+                    # encryptor_locations = [best_location[0], best_location[1] + 1]
+                    # game_state.attempt_spawn(ENCRYPTOR, encryptor_locations)
+                else:
+                    game_state.attempt_spawn(SCRAMBLER, [14,0])
+                
                 # Lastly, if we have spare cores, let's build some Encryptors to boost our Pings' health.
-                encryptor_locations = [[13, 2], [14, 2], [13, 3], [14, 3]]
+                encryptor_locations = [[13, 2], [14, 2],  [13, 3], [14, 3], [13, 4], [14, 4], [12, 4],
+                                        [15, 4], [11, 5], [16, 5], [12, 5], [15, 5]]
                 game_state.attempt_spawn(ENCRYPTOR, encryptor_locations)
+
+    def find_self_units(self, game_state):
+        for x in range(0, 28):
+            for y in range(13 - x, 14):
+                if (game_state.game_map.in_arena_bounds([x,y])):
+                    for unit in game_state.game_map[[x,y]]:
+                        self.firewall_loc[unit.unit_type].append([x,y])
 
     def build_defences(self, game_state):
         """
@@ -113,12 +147,13 @@ class AlgoStrategy(gamelib.AlgoCore):
         # More community tools available at: https://terminal.c1games.com/rules#Download
 
         # Place destructors that attack enemy units
-        destructor_locations = [[0, 13], [27, 13], [8, 11], [19, 11], [13, 11], [14, 11]]
+        destructor_locations = [[1,12],[2,12],[5,11],[6,11],[11,11],[12,11],[15,11],[16,11],
+                                [21,11],[22,11],[25,12],[26,12]]
         # attempt_spawn will try to spawn units if we have resources, and will check if a blocking unit is already there
         game_state.attempt_spawn(DESTRUCTOR, destructor_locations)
         
         # Place filters in front of destructors to soak up damage for them
-        filter_locations = [[8, 12], [19, 12]]
+        filter_locations = [[0,13],[27,13], [1, 13], [2, 13], [3, 13], [24, 13], [25, 13], [26, 13]]
         game_state.attempt_spawn(FILTER, filter_locations)
         # upgrade filters so they soak more damage
         game_state.attempt_upgrade(filter_locations)
@@ -131,8 +166,47 @@ class AlgoStrategy(gamelib.AlgoCore):
         """
         for location in self.scored_on_locations:
             # Build destructor one space above so that it doesn't block our own edge spawn locations
-            build_location = [location[0], location[1]+1]
-            game_state.attempt_spawn(DESTRUCTOR, build_location)
+            filter_loc = []
+            dest_loc = []
+            if location[0] < 13:
+                filter_loc = [[location[0] + 1, location[1] + 2], [location[0] + 2, location[1] + 1]]
+                dest_loc = [[location[0] + 1, location[1] + 1]]
+            else:
+                filter_loc = [[location[0] - 1, location[1] + 2], [location[0] - 2, location[1] + 1]]
+                dest_loc = [[location[0] - 1, location[1] + 1]]
+            game_state.attempt_spawn(FILTER, filter_loc)
+            game_state.attempt_spawn(DESTRUCTOR, dest_loc)
+
+    def repair_defences(self, game_state):
+        for dest_loc in self.firewall_loc["DF"]:
+            for unit in game_state.game_map[dest_loc]:
+                if unit.health < unit.max_health / 2:
+                    game_state.attempt_remove(dest_loc)
+                    self.repair_queue.append(["DF", dest_loc])
+        for filter_loc in self.firewall_loc["FF"]:
+            for unit in game_state.game_map[filter_loc]:
+                if unit.health < unit.max_health / 2:
+                    game_state.attempt_remove(filter_loc)
+                    self.repair_queue.append(["FF", filter_loc])
+        self.repair_build(game_state)
+    
+    def repair_build(self, game_state):
+        for arr in self.repair_queue:
+            game_state.attempt_spawn(arr[0], arr[1])
+            self.repair_queue.pop(0)
+
+    def upgrade(self, game_state):
+        if self.firewall_loc["FF"] != []: 
+            game_state.attempt_upgrade(self.firewall_loc["FF"])
+        for dest_loc in self.firewall_loc["DF"]:
+            if game_state.get_resource(0) <= 8: break
+            game_state.attempt_upgrade(dest_loc)
+
+    def build_def2(self, game_state):
+        for arr in self.repair_queue:
+            game_state.attempt_spawn(FILTER, [arr[1][0], arr[1][1] + 1])
+        for loc in self.firewall_loc["DF"]:
+            game_state.attempt_spawn(FILTER, [loc[0], loc[1] + 1])
 
     def stall_with_scramblers(self, game_state):
         """
@@ -146,11 +220,11 @@ class AlgoStrategy(gamelib.AlgoCore):
         deploy_locations = self.filter_blocked_locations(friendly_edges, game_state)
         
         # While we have remaining bits to spend lets send out scramblers randomly.
-        while game_state.get_resource(BITS) >= game_state.type_cost(SCRAMBLER)[BITS] and len(deploy_locations) > 0:
+        while game_state.get_resource(BITS) >= game_state.type_cost(SCRAMBLER)[BITS] + 3 and len(deploy_locations) > 0:
             # Choose a random deploy location.
             deploy_index = random.randint(0, len(deploy_locations) - 1)
             deploy_location = deploy_locations[deploy_index]
-            
+
             game_state.attempt_spawn(SCRAMBLER, deploy_location)
             """
             We don't have to remove the location since multiple information 
@@ -172,8 +246,9 @@ class AlgoStrategy(gamelib.AlgoCore):
 
         # Now let's build out a line of stationary units. This will prevent our EMPs from running into the enemy base.
         # Instead they will stay at the perfect distance to attack the front two rows of the enemy base.
-        for x in range(27, 5, -1):
-            game_state.attempt_spawn(cheapest_unit, [x, 11])
+        for x in range(27, 10, -1):
+            game_state.attempt_spawn(cheapest_unit, [x, 12])
+            # game_state.attempt_remove([x, 12])
 
         # Now spawn EMPs next to the line
         # By asking attempt_spawn to spawn 1000 units, it will essentially spawn as many as we have resources for
@@ -190,13 +265,14 @@ class AlgoStrategy(gamelib.AlgoCore):
         for location in location_options:
             path = game_state.find_path_to_edge(location)
             damage = 0
-            for path_location in path:
-                # Get number of enemy destructors that can attack the final location and multiply by destructor damage
-                damage += len(game_state.get_attackers(path_location, 0)) * gamelib.GameUnit(DESTRUCTOR, game_state.config).damage_i
+            if path != None:
+                for path_location in path:
+                    # Get number of enemy destructors that can attack the final location and multiply by destructor damage
+                    damage += len(game_state.get_attackers(path_location, 0)) * gamelib.GameUnit(DESTRUCTOR, game_state.config).damage_i
             damages.append(damage)
         
         # Now just return the location that takes the least damage
-        return location_options[damages.index(min(damages))]
+        return location_options[damages.index(min(damages))], min(damages)
 
     def detect_enemy_unit(self, game_state, unit_type=None, valid_x = None, valid_y = None):
         total_units = 0
